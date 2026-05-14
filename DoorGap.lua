@@ -11,6 +11,51 @@ local showDebug = false
 local dbgPos  = {}  -- vec3 cache of recorded positions
 local dbgLook = {}  -- vec3 cache of recorded look dirs
 
+-- Ghost playback state
+local ghostPlaying   = false
+local ghostTime      = 0
+local ghostPos       = nil  ---@type vec3?
+local ghostLook      = nil  ---@type vec3?
+local ghostTransform = nil  ---@type mat4x4?
+local ghostHit       = false  -- true when player overlaps ghost position
+
+-- Per-frame body transforms (in-memory only, not serialised)
+local frameTransforms = {}
+
+-- Pre-allocated render.mesh drawcall table (avoid per-frame GC)
+local ghostMeshCall = {
+  mesh      = nil,
+  transform = mat4x4(),
+  textures  = {},
+  values    = { gColor = rgbm(0.45, 0.80, 1.0, 1), gAlpha = 0.40 },
+  shader    = 'res/ghost.fx',
+}
+
+local function lerpF(a, b, t) return a + (b - a) * t end
+local function lerpV3(a, b, t)
+  return vec3(lerpF(a.x, b.x, t), lerpF(a.y, b.y, t), lerpF(a.z, b.z, t))
+end
+
+local function updateGhost(dt)
+  if not ghostPlaying or #frames < 2 then return end
+  ghostTime = ghostTime + dt
+  local frameF = ghostTime / INTERVAL + 1
+  if frameF >= #frames then
+    ghostPlaying = false
+    ghostPos, ghostLook, ghostTransform = nil, nil, nil
+    ghostHit = false
+    return
+  end
+  local i = math.floor(frameF)
+  local t = frameF - i
+  local f0, f1 = frames[i], frames[i + 1]
+  ghostPos       = lerpV3(f0.pos,  f1.pos,  t)
+  ghostLook      = lerpV3(f0.look, f1.look, t)
+  ghostTransform = frameTransforms[i]  -- snap-to-nearest frame (30 Hz is fine)
+  -- ~3.5 m radius hit sphere (roughly half a car length)
+  ghostHit = car.position:distanceSquared(ghostPos) < 3.5 * 3.5
+end
+
 local function rebuildDebugCache()
   dbgPos  = {}
   dbgLook = {}
@@ -22,28 +67,44 @@ end
 
 -- 3D world overlay
 function script.draw3D()
-  if not showDebug or #dbgPos == 0 then return end
+  local hasMesh   = ghostTransform ~= nil
+  local hasDebug  = showDebug and #dbgPos > 0
+  if not hasMesh and not hasDebug then return end
 
   render.setDepthMode(render.DepthMode.Off)
+  local camNorm = -ac.getCameraForward()
 
-  local n       = #dbgPos
-  local camNorm = -ac.getCameraForward()  -- always face the camera
-  local dotStep   = math.max(1, math.floor(n / 300))
-  local arrowStep = math.max(1, math.floor(n / 60))
-
-  -- Red path dots (dense trail)
-  for i = 1, n, dotStep do
-    render.circle(dbgPos[i], camNorm, 0.3, rgbm(1, 0.2, 0.2, 0.9))
+  -- Debug path + direction arrows
+  if hasDebug then
+    local n         = #dbgPos
+    local dotStep   = math.max(1, math.floor(n / 300))
+    local arrowStep = math.max(1, math.floor(n / 60))
+    for i = 1, n, dotStep  do render.circle(dbgPos[i],                  camNorm, 0.3, rgbm(1,   0.2, 0.2, 0.9)) end
+    for i = 1, n, arrowStep do render.circle(dbgPos[i],                  camNorm, 0.6, rgbm(0,   0.7, 1,   0.3), rgbm(0, 0.7, 1, 1)) end
+    for i = 1, n, arrowStep do render.circle(dbgPos[i]+dbgLook[i]*1.5,  camNorm, 0.2, rgbm(1,   1,   0,   1  )) end
   end
 
-  -- Cyan position markers (bigger ring)
-  for i = 1, n, arrowStep do
-    render.circle(dbgPos[i], camNorm, 0.6, rgbm(0, 0.7, 1, 0.3), rgbm(0, 0.7, 1, 1))
+  -- Ghost car mesh (rendered from recorded bodyTransform)
+  if hasMesh then
+    if ghostHit then
+      ghostMeshCall.values.gColor = rgbm(1.0, 0.25, 0.1, 1)
+      ghostMeshCall.values.gAlpha = 0.75
+    else
+      ghostMeshCall.values.gColor = rgbm(0.45, 0.80, 1.0, 1)
+      ghostMeshCall.values.gAlpha = 0.40
+    end
+    ghostMeshCall.mesh = ac.SimpleMesh.carShape(0, true)
+    ghostMeshCall.transform:set(ghostTransform)
+    render.mesh(ghostMeshCall)
   end
 
-  -- Yellow dot 1.5 m ahead = look direction indicator
-  for i = 1, n, arrowStep do
-    render.circle(dbgPos[i] + dbgLook[i] * 1.5, camNorm, 0.2, rgbm(1, 1, 0, 1))
+  -- Ghost position indicator (sphere stays at lerped position)
+  if ghostPos then
+    render.circle(ghostPos, camNorm, 1.2, rgbm(0.2, 1, 0.3, 0.5), rgbm(0.2, 1, 0.3, 1))
+    render.circle(ghostPos, camNorm, 0.6, rgbm(0.2, 1, 0.3, 0.9))
+    if ghostLook then
+      render.circle(ghostPos + ghostLook * 1.5, camNorm, 0.25, rgbm(1, 1, 0, 1))
+    end
   end
 end
 
@@ -115,16 +176,42 @@ function script.windowMain(dt)
     if ui.button('Start Recording', vec2(-1, 0)) then
       recording = true
       frames = {}
+      frameTransforms = {}
       timer = 0
       saveStatus = ''
     end
     if saveStatus ~= '' then
       ui.textColored(saveStatus, rgbm(0.3, 1, 0.3, 1))
     end
+
+    -- Ghost controls (main feature)
+    if #frames >= 2 then
+      ui.separator()
+      if not ghostPlaying then
+        if ui.button('▶  Play Ghost', vec2(-1, 0)) then
+          ghostPlaying = true
+          ghostTime    = 0
+          ghostPos, ghostLook, ghostTransform = nil, nil, nil
+          ghostHit = false
+        end
+      else
+        ui.textColored(string.format('▶ Ghost  %.1f s', ghostTime), rgbm(0.2, 1, 0.3, 1))
+        if ui.button('■  Stop Ghost', vec2(-1, 0)) then
+          ghostPlaying = false
+          ghostPos, ghostLook, ghostTransform = nil, nil, nil
+          ghostHit = false
+        end
+      end
+    end
+
+    -- Debug section (collapsible)
     if #dbgPos > 0 then
       ui.separator()
-      if ui.checkbox('Show Path  (' .. #dbgPos .. ' pts)', showDebug) then
-        showDebug = not showDebug
+      if ui.treeNode('Debug') then
+        if ui.checkbox('Show Path  (' .. #dbgPos .. ' pts)', showDebug) then
+          showDebug = not showDebug
+        end
+        ui.treePop()
       end
     end
   else
@@ -138,6 +225,7 @@ function script.windowMain(dt)
 end
 
 function script.update(dt)
+  updateGhost(dt)
   if not recording then return end
   timer = timer + dt
   if timer >= INTERVAL then
@@ -149,5 +237,9 @@ function script.update(dt)
       steer = car.steer,
       gas   = car.gas,
     })
+    -- Store full body transform for ghost mesh rendering (in-memory only)
+    local bt = mat4x4()
+    bt:set(car.bodyTransform)
+    table.insert(frameTransforms, bt)
   end
 end
