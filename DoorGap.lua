@@ -27,7 +27,7 @@ local ghostMeshCall = {
   mesh      = nil,
   transform = mat4x4(),
   textures  = {},
-  values    = { gColor = rgbm(0.45, 0.80, 1.0, 1), gAlpha = 0.40 },
+  values    = { gAlpha = 0.55, gHit = 0.0 },
   shader    = 'res/ghost.fx',
 }
 
@@ -86,25 +86,11 @@ function script.draw3D()
 
   -- Ghost car mesh (rendered from recorded bodyTransform)
   if hasMesh then
-    if ghostHit then
-      ghostMeshCall.values.gColor = rgbm(1.0, 0.25, 0.1, 1)
-      ghostMeshCall.values.gAlpha = 0.75
-    else
-      ghostMeshCall.values.gColor = rgbm(0.45, 0.80, 1.0, 1)
-      ghostMeshCall.values.gAlpha = 0.40
-    end
+    ghostMeshCall.values.gHit   = ghostHit and 1.0 or 0.0
+    ghostMeshCall.values.gAlpha = ghostHit and 0.85 or 0.55
     ghostMeshCall.mesh = ac.SimpleMesh.carShape(0, true)
     ghostMeshCall.transform:set(ghostTransform)
     render.mesh(ghostMeshCall)
-  end
-
-  -- Ghost position indicator (sphere stays at lerped position)
-  if ghostPos then
-    render.circle(ghostPos, camNorm, 1.2, rgbm(0.2, 1, 0.3, 0.5), rgbm(0.2, 1, 0.3, 1))
-    render.circle(ghostPos, camNorm, 0.6, rgbm(0.2, 1, 0.3, 0.9))
-    if ghostLook then
-      render.circle(ghostPos + ghostLook * 1.5, camNorm, 0.25, rgbm(1, 1, 0, 1))
-    end
   end
 end
 
